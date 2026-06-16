@@ -6,6 +6,8 @@ Sway 桌面环境相关的配置、脚本、技能仓库。
 
 ```
 mcpSway/
+├── AGENTS.md      # AI Agent 工作指南
+├── PRINCIPLES.md  # 仓库基本原则
 ├── skills/        # Hermes 技能定义（SKILL.md）
 ├── scripts/       # 实用脚本（sway-session 等）
 ├── configs/       # 参考配置（waybar、sway、wofi 等）
