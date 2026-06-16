@@ -2,21 +2,35 @@
 """
 mcpSway MCP Server — 通过 stdio 协议将 mcpSway 技能库暴露为 MCP 工具。
 
-协议：MCP JSON-RPC over stdio
-- tools/list → 列出所有技能
-- tools/call → 读取指定技能内容
+协议：MCP JSON-RPC over stdio（符合 MCP 2025-03-26 规范）
+生命周期：
+  1. client → initialize → server → InitializeResult
+  2. client → initialized (notification, 无需回复)
+  3. client → tools/list → server → tools[]
+  4. client → tools/call → server → content[]
 
 部署后注册到 LiteLLM config.yaml 的 mcp_servers 段。
 """
 
 import json
 import sys
-import os
 from pathlib import Path
 
-# mcpSway 仓库根目录（脚本所在目录的父目录，或上级的 mcps/mcpSway/）
+# SWAY_DIR = mcpSway 子模块所在路径（脚本在 mcps/ 根目录，mcpSway 在同级子目录）
 HERE = Path(__file__).resolve().parent
-SWAY_DIR = HERE  # 脚本放在 mcpSway 根目录
+SWAY_DIR = HERE / "mcpSway"
+
+MCP_PROTOCOL_VERSION = "2025-03-26"
+
+SERVER_INFO = {
+    "name": "mcpSway",
+    "version": "1.0.0",
+}
+
+# 服务器能力声明：仅支持 tools（不提供 resources / prompts）
+CAPABILITIES = {
+    "tools": {},
+}
 
 def load_skills(base: Path) -> list[dict]:
     """扫描 skills/ 子目录，返回技能元信息列表"""
@@ -111,6 +125,7 @@ def handle_call_tool(name: str, arguments: dict) -> dict:
 
 def main():
     """MCP stdio 协议主循环：读 stdin JSON-RPC，写 stdout JSON-RPC"""
+    initialized = False
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -120,8 +135,30 @@ def main():
         except json.JSONDecodeError:
             continue
 
-        req_id = req.get("id", 1)
         method = req.get("method", "")
+        req_id = req.get("id")
+
+        # MCP 初始化握手
+        if method == "initialize":
+            params = req.get("params", {})
+            client_version = params.get("protocolVersion", MCP_PROTOCOL_VERSION)
+            resp = {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "protocolVersion": client_version,
+                    "capabilities": CAPABILITIES,
+                    "serverInfo": SERVER_INFO,
+                },
+            }
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+            continue
+
+        # initialized notification — 无需回复
+        if method == "notifications/initialized":
+            initialized = True
+            continue
+
         params = req.get("params", {})
 
         if method == "tools/list":
@@ -131,7 +168,13 @@ def main():
             arguments = params.get("arguments", {})
             result = handle_call_tool(name, arguments)
         else:
-            result = {"error": f"Unknown method: {method}"}
+            resp = {
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+            continue
 
         resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
         sys.stdout.write(json.dumps(resp) + "\n")
