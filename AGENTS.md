@@ -12,11 +12,12 @@ Sway 桌面环境相关的配置、脚本、技能定义仓库。
 
 ```
 mcpSway/
-├── skills/        # Hermes 技能定义（SKILL.md），每个子目录一个技能
-├── scripts/       # 实用脚本（sway-session 等，带中文注释）
-├── configs/       # 参考配置（sway/ waybar/ wofi/ mako/ fcitx5/ systemd/ environment/）
-├── docs/          # 文档与笔记（硬件信息、已知问题、workaround）
-├── PRINCIPLES.md  # 仓库基本原则（详细版）
+├── skills/
+│   └── local/      # Hermes 技能定义（SKILL.md），每个子目录一个技能
+├── scripts/         # 实用脚本（sway-session 等，带中文注释）
+├── configs/         # 参考配置（sway/ waybar/ wofi/ mako/ fcitx5/ systemd/ environment/）
+├── docs/            # 文档与笔记（硬件信息、已知问题、workaround）
+├── PRINCIPLES.md    # 仓库基本原则（详细版）
 └── README.md
 ```
 

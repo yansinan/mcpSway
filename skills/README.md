@@ -6,18 +6,21 @@
 
 ## 技能索引
 
-| 技能 | 描述 | 来源 |
-|------|------|------|
-| `waybar-config` | Waybar 配置参考：双栏布局、模块、custom/* JSON、Pango tooltip、API 凭证、PWA 图标、CSS、陷阱、调试 | 官方 Wiki + man page |
-| `sway-debian-setup` | Sway 安装配置（Debian）：显示管理、fcitx5 输入法、蓝牙、会话保存/恢复 | swaywm.org + man pages |
-| `sway-desktop-tuning` | Sway 桌面调优：swayidle 配置陷阱、S0ix 电源、PipeWire 音频诊断、HDA 引脚调试 | sway man page + Arch Wiki |
-| `linux-audio-pipewire` | PipeWire/WirePlumber 音频诊断命令、HDMI/DP 音频问题、蓝牙音频 | Arch Wiki PipeWire |
-| `uxplay` | UxPlay AirPlay 投屏服务：Debian 安装、sway 集成、常见坑点 | GitHub FDH2/UxPlay |
-| `debian-btrfs-system` | Debian btrfs 系统管理：@rootfs → @/@home 子卷迁移、Timeshift btrfs 快照、GRUB/LVM 引导修复 | timeshift GitHub + Arch Wiki btrfs |
-| `wayland-rdp-setup` | 合并自 3 个 RDP 技能 — lamco-rdp-server 远程桌面安装/EGFX 调试/OpenH264/多 compositor | GitHub lamco + lamco.ai |
-| `apple-icloud-linux` | Linux iCloud Drive/Photos 挂载（rclone）、国内/全球 Apple ID、2FA、rclone web UI | rclone.org iClouddrive |
-| `python-dockerize` | Python 项目 Docker 化：最小镜像策略、docker-compose、config 管理 | Docker Compose docs |
-| `linux-system-resource-analysis` | Linux 系统资源分析：内存/CPU/多主机对比/sway 桌面内存追踪 | kernel.org proc docs |
+所有本地自建技能集中在 `local/` 子目录下：
+
+```
+skills/local/
+├── apple-icloud-linux         Linux iCloud Drive/Photos 挂载
+├── debian-btrfs-system        btrfs 子卷迁移 + Timeshift 快照
+├── linux-audio-pipewire       PipeWire 音频诊断
+├── linux-system-resource-analysis  系统资源分析
+├── python-dockerize           Python Docker 化
+├── sway-debian-setup          Sway 安装配置
+├── sway-desktop-tuning        Sway 桌面调优
+├── uxplay                     AirPlay 投屏服务
+├── waybar-config              Waybar 配置
+└── wayland-rdp-setup          RDP 远程桌面
+```
 
 ## 添加新技能
 
