@@ -1,0 +1,31 @@
+# swayidle configuration
+# ─────────────────────────────────────────────────────────────────────
+# Two parsing rules to remember (see sway-desktop-tuning skill, "CRITICAL" section):
+#   1. Each event command must be a single-token path to a script file.
+#      Inline `sh -c "..."` gets truncated to just `sh` and the rest is lost.
+#   2. `timeout` and its `resume` MUST be on the SAME line. Config is parsed
+#      line-by-line, no multi-line continuation.
+#
+# All events below delegate to a unified `sway-session` script (see
+# templates/sway-session.py) — this user's strong preference is one
+# unified entry point with subcommands, not scattered helper scripts.
+# ─────────────────────────────────────────────────────────────────────
+
+# 60s after no activity: mark the user idle so the daemon skips its 5-min save
+# (covers "user walked away" case; the save will resume on next activity)
+timeout 60 ~/Scripts/sway-session --mark-idle resume ~/Scripts/sway-session --mark-active
+
+# 60 minutes after no activity: turn off the external monitor to save power
+# (always pair with a resume action — otherwise the screen stays black forever)
+timeout 3600 ~/Scripts/sway-session --screen-off resume ~/Scripts/sway-session --screen-on
+
+# ── Add more events here as needed. Common additions: ───────────────
+# Lock screen on idle (requires swaylock):
+#   timeout 300 ~/Scripts/sway-session --lock resume ~/Scripts/sway-session --unlock
+#
+# Suspend on long idle:
+#   timeout 1800 ~/Scripts/sway-session --suspend
+#
+# Tell logind about session idle (so logind's IdleAction kicks in):
+#   idlehint 300
+#   (note: idlehint takes no resume — it auto-clears on user activity)
