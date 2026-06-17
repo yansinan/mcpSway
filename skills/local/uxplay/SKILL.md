@@ -49,10 +49,41 @@ This starts the service. iPhone/iPad/Mac (same LAN) sees the computer name in Co
 |------|---------|
 | `-n "Some Name"` | Custom AirPlay display name |
 | `-nh` | Don't append `@hostname` |
-| `-h265` | Enable H.265 (4K) video (needs compatible GPU/decode) |
+| `-s wxh` | Requested client resolution (default `1920x1080`; e.g. `-s 3840x2160` for 4K). Client may not honor exactly. |
+| `-s wxh@r` | Resolution + refresh rate in Hz (default `@60`). |
+| `-h265` | Enable H.265 (4K) video. Changes default `-s` from 1080p → 4K. Needs recent Apple device. |
+| `-fps n` | Max frame rate request to client (default 30; `-fps 60` for smoother video) |
+| `-fs` | Fullscreen mode (works with Wayland/X11/KMS/D3D11). 与 `-vs "waylandsink fullscreen=true"` 或 sway `for_window` 规则配合使用。 |
+| `-vs videosink` | Choose GStreamer videosink. On sway/Wayland: `-vs "waylandsink fullscreen=true"` — 用引号将 videosink 名和属性括起来作为单个参数，这是文档指定的写法（`-fs` 也同时生效）。 |
 | `-p` | Random PIN code on each connect |
 | `-p 1234` | Fixed PIN code |
 | `-vsync no` | Disable audio/video sync if out of sync |
+
+### 分辨率/渲染窗口控制
+
+UxPlay 有两个层面可以控制画面大小：
+
+**客户端分辨率（`-s`）** — 向 iPhone/iPad 请求特定的流分辨率。这只是建议，客户端可能不严格遵守。默认 1920×1080；与 `-h265` 组合时默认升为 3840×2160。
+
+**渲染窗口（`-vs` + `-fs` + sway rules）** — GStreamer 视频输出窗口的行为由 videosink 参数控制。文档指定写法：`-vs "waylandsink fullscreen=true"`（引号将 videosink 名和属性作为单个参数传入）。在 sway 中三层全屏可共存：
+
+| 层 | 方式 | 说明 |
+|----|------|------|
+| GStreamer 层 | `-vs "waylandsink fullscreen=true"` | 让 waylandsink 窗口创建即全屏 |
+| uxplay 层 | `-fs` | uxplay 自身请求全屏模式 |
+| sway 层 | `for_window [app_id="uxplay"] fullscreen enable` | sway 窗口规则兜底 |
+
+**推荐组合（x1tablet 实测）：**
+```bash
+uxplay -n x1tablet -s 3840x2160 -h265 -fps 60 -fs -vs "waylandsink fullscreen=true"
+```
+
+sway 端配合：
+```ini
+# ~/.config/sway/config
+exec_always uxplay -n x1tablet -s 3840x2160 -h265 -fps 60 -fs -vs "waylandsink fullscreen=true"
+for_window [app_id="uxplay"] fullscreen enable
+```
 
 ### Window behavior
 - Press `q` or `Ctrl+C` in the running terminal to quit.
