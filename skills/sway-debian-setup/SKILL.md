@@ -132,12 +132,53 @@ bindsym $mod+d exec fuzzel
 
 **There is no `--overwrite` flag.** Check `man 5 sway` before guessing flags.
 
+### ⚠️ 必须重点：`exec_always` 防多进程（reload 后唯一实例）
+
+> sway(5) 文档原文：*"Like exec, but the shell command will be executed again after reload."*
+>
+> `exec_always` 的语义就是在每次 reload 时 **再执行一次** — **没有任何内置去重机制**。这意味着连续两次 `$mod+Shift+c` reload，uxplay、blueman-applet 等程序会叠出多个副本，互相冲突或白白吃内存。
+>
+> **社区标准解** — 在命令外套 `bash -c 'pkill -x <程序名> 2>/dev/null; sleep 0.2; exec <程序名> ...'`，每次 reload 先杀旧进程再起新进程。三步原理：
+>
+> | 步骤 | 作用 |
+> |------|------|
+> | `pkill -x <name> 2>/dev/null` | 精确匹配进程名杀掉旧实例，`-x` 防止误杀同名子进程，`2>/dev/null` 静默无进程时的错误 |
+> | `sleep 0.2` | 等待旧进程释放端口/资源（UXPlay 的 mDNS/AirPlay 端口释放需 ~100ms） |
+> | `exec <name> ...` | `exec` 替换当前 shell 进程，不给 bash 留下孤儿进程 |
+>
+> 以下 `exec_always` 都需要此模式：
+
+| 程序 | 是否自带防重 | 需要 pkill？ |
+|------|------------|-------------|
+| `uxplay` | ❌ 无 | `pkill -x uxplay; exec uxplay ...` |
+| `blueman-applet` | ❌ 无 | `pkill -x blueman-applet; exec blueman-applet` |
+| `waybar` | ❌ 无 | 已有 `killall waybar` 在脚本内 |
+| `kanshi` | ⚠️ 手动 | 已有 `killall kanshi` 在同文件上一条 |
+| `fcitx5` | ✅ `-d --replace` | 不必（`--replace` 自带替换语义） |
+
+**正确写法（以 uxplay 为例）：**
+
+```ini
+exec_always bash -c 'pkill -x uxplay 2>/dev/null; sleep 0.2; exec uxplay -n 餐桌 -s 1920x1080 -fps 60 -fs -vs "waylandsink fullscreen=true"'
+```
+
+**错误写法（两个进程同时运行）：**
+
+```ini
+exec_always uxplay -n 餐桌 ...
+```
+
+**注意**：`pkill -x` 根据 `/proc/<PID>/comm` 精确匹配进程名（最大 15 字符），不会误杀 `python3.11`、`chrome` 等无关进程。
+
 ### Minimal working config
 
 ```
 include /etc/sway/config
-exec_always killall kanshi 2>/dev/null
-exec_always kanshi
+
+# —— 所有 exec_always 必须先 pkill 再 exec，防止 reload 多进程 ——
+exec_always bash -c 'killall kanshi 2>/dev/null; exec kanshi'
+exec_always bash -c 'pkill -x fcitx5 2>/dev/null; exec fcitx5 -d --replace'
+
 unbindsym $mod+d
 # fuzzel: scans .desktop files (Chrome PWAs, system apps). bemenu: PATH only.
 bindsym $mod+d exec fuzzel
@@ -206,11 +247,10 @@ profile single {
 }
 ```
 
-Add to Sway config:
+Add to Sway config — 详见上方 **`exec_always` 防多进程** 重点章节：
 
-```
-exec_always killall kanshi 2>/dev/null
-exec_always kanshi
+```ini
+exec_always bash -c 'killall kanshi 2>/dev/null; exec kanshi'
 ```
 
 ### Troubleshooting: monitor detected but no signal
@@ -734,12 +774,11 @@ GLFW_IM_MODULE=fcitx
 
 This is the proper Wayland-compatible approach via systemd user environment.
 
-**In `~/.config/sway/config`** (only the launcher line is needed):
+**In `~/.config/sway/config`** (only the launcher line is needed) — fcitx5 的 `--replace` 标志自带替换语义，reload 时不需额外 pkill（详见上方 **`exec_always` 防多进程** 重点章节）：
 
-```
+```ini
 exec_always fcitx5 -d --replace 2>/dev/null
 ```
-
 ⚠ **DO NOT use `set` for env vars in Sway config.** `set` in Sway defines Sway internal variables only (e.g. `set $mod Mod4`) — it cannot set system environment variables. Doing `set GTK_IM_MODULE fcitx` causes `sway --validate` to error with `"variable must start with $"` and prevents Sway from loading the config. Use `~/.config/environment.d/` instead.
 
 **System-wide via im-config:**
@@ -861,10 +900,10 @@ sudo apt install -y libspa-0.2-bluetooth
 
 ### Sway config
 
-Add to `~/.config/sway/config`:
+Add to `~/.config/sway/config` — 必须用 pkill 模式防 reload 多进程（详见上方 **`exec_always` 防多进程** 重点章节）：
 
-```
-exec_always blueman-applet
+```ini
+exec_always bash -c 'pkill -x blueman-applet 2>/dev/null; sleep 0.2; exec blueman-applet'
 ```
 
 After adding, reload sway: `swaymsg reload` (only works from inside a sway session).
@@ -1413,7 +1452,7 @@ Sway's `for_window` (and other criteria-based commands) uses two matching operat
 - **Duplicate binding warnings**: Use `--no-warn` flag only if you want to suppress the warning. Cleaner: `unbindsym` + `bindsym`.
 - **Compositor can't start on SSH**: Sway needs a TTY (real display). Run from TTY, not SSH.
 - **Session save file location**: MUST NOT use `/tmp` — it's wiped on reboot. Use `~/.config/sway/sway-session.json` or another persistent path.
-- **`exec` vs `exec_always`**: `exec` runs only on fresh sway start. `swaymsg reload` does NOT re-run `exec`. `exec_always` runs on every config reload.
+- **`exec` vs `exec_always` + 防多进程**：`exec` 只在 sway 首次启动时运行一次，`swaymsg reload` **不会**重跑 `exec`。`exec_always` 每次 reload 都再执行一次。**`exec_always` 必须搭配 `bash -c 'pkill -x <name>; exec <name>'`** 防止 reload 后多进程（详见上方 **`exec_always` 防多进程** 重点章节）
 - **Chrome PWA dedup pitfall**: Same PID = same `/proc/PID/cmdline`, but the process can host multiple PWA windows with different `app_id` values. Dedup by cmdline means secondary PWAs won't auto-launch unless Chrome's session restore handles them.
 - **Kanshi port names go stale**: Output names like `DP-2` vs `DP-3` can fluctuate across reboots, cable re-seats, or driver updates. If the monitor stops working suddenly, `swaymsg -t get_outputs` to check the current name, then update your kanshi config.
 - **fcitx5**: After install, Pinyin may not be in the active input method list. Run `fcitx5-config-qt` and explicitly add it, or edit `~/.config/fcitx5/profile` directly (see above). If switching languages doesn't work, check that `fcitx5` is actually running via `ps aux | grep fcitx`.
