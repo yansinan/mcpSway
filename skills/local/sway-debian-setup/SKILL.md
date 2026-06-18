@@ -378,6 +378,255 @@ swaymsg 'output DP-<N> max_render_time 1'
 swaymsg 'output DP-<N> allow_tearing true'
 ```
 
+
+## Browsers under Wayland
+
+Sway is a Wayland compositor. Browsers running under XWayland (the default for most) work but miss features like proper touchscreen support, smooth pinch-to-zoom, and correct screen sharing. Configure them to run natively on Wayland.
+
+### Chromium / Google Chrome
+
+```bash
+sudo apt install -y chromium chromium-l10n
+```
+
+Chrome/Chromium detect Wayland automatically in recent versions, but to force native Wayland:
+
+```bash
+# Per-run
+chromium --ozone-platform-hint=auto
+
+# Permanent (system-wide) — Debian's standard hook
+sudo tee /etc/chromium.d/wayland > /dev/null << 'EOF'
+# Enable Wayland native support for Chromium under Sway
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --ozone-platform-hint=auto"
+EOF
+```
+
+`--ozone-platform-hint=auto` is preferred over the older `--ozone-platform=wayland` — it auto-detects Wayland vs X11, falling back gracefully when not on Wayland.
+
+Once running natively, sway sees its `app_id` as `"chromium-browser"` — useful for `for_window` rules. PWAs spawned from Chromium use `"^chromium-"` prefix.
+
+**Sway config pattern** (keyboard shortcut + no title bar):
+
+```
+# ── Chromium ──
+bindsym $mod+Shift+w exec chromium
+for_window [app_id="chromium-browser"] border pixel 1
+for_window [app_id="^chromium"] border pixel 1    # covers PWAs too
+```
+
+Video Acceleration (VA-API):
+
+Chromium ships its own ffmpeg codecs; the key optimization is hardware-accelerated decoding.
+
+Install system video packages:
+
+```bash
+sudo apt install -y gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-vaapi vainfo
+```
+
+Enable in CHROMIUM_FLAGS (`/etc/chromium.d/wayland`):
+
+```bash
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --enable-features=VaapiVideoDecoder,VaapiVideoEncoder"
+```
+
+VA-API driver selection by GPU generation:
+
+| GPU Generation | Driver Package | Verify With |
+|---|---|---|---|
+| Ivy Bridge (Gen7) / Bay Trail / older | `i965-va-driver` | `vainfo` → "Intel i965 driver for Intel(R) Ivybridge" |
+| Broadwell (Gen8) / Skylake (Gen9) / Kaby Lake (Gen9.5) | `intel-media-va-driver` | `vainfo` → "Intel iHD driver" |
+| Tiger Lake (Gen12) and newer | `intel-media-va-driver` | `vainfo` → "Intel iHD driver" |
+
+Run `vainfo` (no display needed) to confirm hardware support:
+
+```bash
+vainfo 2>&1 | grep -E 'Driver version|VAProfile'
+```
+
+Supported profiles on Ivy Bridge HD 4000 (i965 driver): H.264 (BP/MP/HP/Stereo), MPEG2, VC1, JPEG — **no** HEVC/H.265, VP8, VP9 (software fallback).
+
+Supported profiles on Kaby Lake UHD620 (iHD driver): adds VP8/VP9/HEVC hardware decode. **But Chromium 116+ can't use the i965 driver** — see the pitfall below.
+
+**Quick VA-API compatibility check**: run `scripts/check-vaapi-compatibility.sh` (bundled with this skill) — detects whether VaapiVideoDecoder will work or cause black screen. Exits 0 (compatible) or 1 (incompatible, with suggested fix).
+
+**Verification**: open `chrome://gpu` and check "Graphics Feature Status" → "Video Decode" should be "Hardware Accelerated", or look for command line flags at `chrome://version`.
+
+**CRITICAL PITFALL — VaapiVideoDecoder + VP9 = YouTube black screen**
+
+Enabling `VaapiVideoDecoder` on a GPU that doesn't support VP9 hardware decode (Ivy Bridge, or any pre-Broadwell GPUs) causes YouTube to black screen. The chain:
+
+1. YouTube defaults to VP9 video stream (best quality/bandwidth trade-off)
+2. Chromium sees `VaapiVideoDecoder` enabled → tries VA-API hardware decode for VP9
+3. VA-API driver reports VP9 unsupported
+4. Chromium 116+ **dropped i965 driver support entirely**. Even for H.264, Chromium now only tries the iHD driver (`intel-media-va-driver`), which only supports Broadwell (Gen8) and newer GPUs.
+5. Result: **no VA-API backend at all** — iHD can't init (GPU too old), i965 is no longer supported by Chromium
+6. Chromium's Wayland VA-API path **fails silently** instead of falling back to software decode
+7. Result: black video, no playback
+
+**Verification — confirm VaapiVideoDecoder is the cause:**
+
+```bash
+# 1. Check actual GPU (lspci, not memory)
+lspci -nn | grep VGA
+cat /proc/cpuinfo | grep "model name" | head -1
+
+# 2. Check VA-API driver state
+vainfo 2>&1 | grep -E 'Driver version|init failed|VAProfile'
+
+# 3. Check which driver Chromium is actually using
+# iHD init failed + i965 works → Chromium 116+ can't use i965 → VA-API broken
+# iHD init OK → VA-API should work
+
+# 4. Launch Chromium WITHOUT VaapiVideoDecoder to isolate test
+chromium --disable-accelerated-video-decode
+# → If videos play, VaapiVideoDecoder is the root cause
+```
+
+**Root cause at a glance** — two independent failures that compound:
+
+| Factor | Why it fails |
+|--------|-------------|
+| Chromium 116+ drops i965 entirely | Chromium now exclusively uses the iHD driver (intel-media-va-driver). iHD only supports Broadwell (Gen8) and newer. On Ivy Bridge (Gen7) or older GPUs, iHD can't init → **no VA-API backend at all**, not even for H.264. |
+| VaapiVideoDecoder enabled | Chromium attempts VA-API video decode → fails (no backend) → instead of software fallback, the video pipeline blackscreens. |
+| YouTube uses VP9 | Even if the i965 driver were available, HD 4000 can't VP9-hardware-decode. But the real blocker is the first factor — even H.264 VA-API is gone. |
+
+**The CDP browser paradox**: The Hermes CDP browser (launched with `--ozone-platform=wayland` from a non-sway session) may play YouTube fine even though the user's `$mod+Shift+W` browser doesn't. This is because the CDP browser **didn't get `VaapiVideoDecoder`** from `/etc/chromium.d/wayland` (launched via a different shell context), while the user's browser did. Always check `chrome://version` → command line to confirm which flags are actually active.
+
+**Fix options (choose one):**
+
+A. **h264ify extension** — forces YouTube to stream H.264 instead of VP9. Install via `--load-extension`:
+   ```bash
+   # Download from GitHub
+   cd /tmp && curl -sLO "https://github.com/erkserkserks/h264ify/archive/refs/heads/master.zip"
+   python3 -c "import zipfile; zipfile.ZipFile('/tmp/master.zip').extractall('/tmp/h264ify_src')"
+   mkdir -p ~/.hermes/extensions/
+   cp -r /tmp/h264ify_src/h264ify-master ~/.hermes/extensions/h264ify
+
+   # IMPORTANT: patch the service worker for --load-extension compatibility
+   # Extensions loaded via --load-extension don't reliably fire onInstalled.
+   # Add an onStartup listener:
+   ```
+
+   The service worker fix (`src/service_worker.js`):
+   ```javascript
+   async function registerScripts() { /* ... existing code ... */ }
+   chrome.runtime.onInstalled.addListener(registerScripts);
+   chrome.runtime.onStartup.addListener(registerScripts);  // ← ADD THIS
+   ```
+
+   Then update the sway binding:
+   ```
+   bindsym $mod+Shift+w exec chromium --load-extension=/home/dr/.hermes/extensions/h264ify
+   ```
+
+   **Must fully kill Chromium** before testing — background processes survive window close:
+   ```bash
+   pkill -9 chromium
+   # Then relaunch
+   ```
+
+   Verify in `chrome://extensions` → h264ify should be listed.
+
+   *Note*: Even with h264ify, if VaapiVideoDecode is busted for ALL codecs (i965 dropped, iHD won't init), H.264 will fallback to software decode anyway. The CPU handles 1080p soft decode fine.
+
+   **Service worker pitfall for `--load-extension`**: h264ify uses `chrome.runtime.onInstalled` to register its content script (inject.js) via `chrome.scripting.registerContentScripts`. When loaded via `--load-extension`, `onInstalled` may not fire reliably. The naive fix — adding `chrome.runtime.onStartup.addListener(registerScripts)` — **crashes the extension** because `onStartup` requires the `"background"` permission in the manifest, which h264ify doesn't declare. If the extension becomes "不可用" (grayed out) after clicking Refresh on chrome://extensions, this is why. Fix: remove the `onStartup` line, remove and re-add the extension.
+
+B. **Disable accelerated video decode entirely** (simplest, always works):
+   ```bash
+   # Add to /etc/chromium.d/wayland:
+   export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --disable-accelerated-video-decode"
+   ```
+
+   After disabling, clean up unused VA-API packages:
+   ```bash
+   sudo apt remove -y i965-va-driver intel-media-va-driver gstreamer1.0-vaapi
+   ```
+   These packages exist only for GPU hardware decode. With `--disable-accelerated-video-decode`, they're dead weight.
+
+C. **Remove VaapiVideoDecoder from flags** (same effect as B — video plays via software)
+
+D. **Install Google Chrome** (not Chromium) — Chrome's VA-API integration handles unsupported codecs properly with graceful fallback. Also bundles Widevine DRM out of the box.
+
+**Troubleshooting: "video plays in CDP browser but not in my sway Chromium"**
+
+This is the key diagnostic pattern:
+
+```bash
+# 1. Compare launch flags — look for VaapiVideoDecoder
+# CDP browser (usually works):
+chromium ... --ozone-platform=wayland    # NO VaapiVideoDecoder flag
+# User's sway browser (black screen):
+chromium                                 # Gets VaapiVideoDecoder from /etc/chromium.d/wayland
+
+# 2. Check video state in CDP browser (to confirm codec):
+browser_console(expression='document.querySelector("video").paused')
+# If paused=true, click play button
+
+# 3. Root cause test — launch sway Chromium without VaapiVideoDecoder:
+chromium --disable-accelerated-video-decode
+# If videos now play, VaapiVideoDecoder is the culprit
+```
+
+**Diagnostic minimum**: always check two things:
+- `chrome://version` → command line flags (is `VaapiVideoDecoder` there?)
+- GPU generation via `vainfo` → does it support VP9 hardware decode?
+
+### CDP Remote Debugging Mode
+
+When Hermes Agent uses the browser toolset (navigate/click/snapshot), it connects to a CDP endpoint at `browser.cdp_url`. For local usage on Sway:
+
+1. Create a dedicated profile at `~/.hermes/cdp-chrome/` — separate from your daily browser, avoids session conflicts.
+2. Set a custom new-tab background color (e.g. `#1a73e8`) for visual distinction.
+3. Launch from the Hermes session with explicit Wayland env vars (non-GUI session won't inherit them):
+   ```bash
+   XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 \
+   XDG_SESSION_TYPE=wayland chromium \
+     --remote-debugging-port=9222 \
+     --user-data-dir=~/.hermes/cdp-chrome \
+     --no-first-run --no-default-browser-check --ozone-platform=wayland
+   ```
+4. Update `browser.cdp_url` via `hermes config set`.
+5. Clean up port 9222 conflicts (SSH tunnels to remote hosts, old headless Playwright instances) before launching.
+
+See [cdp-browser-config.md](references/cdp-browser-config.md) for the full workflow, including troubleshooting SSH tunnel conflicts and YouTube playback verification.
+
+### Firefox / Firefox ESR
+
+```bash
+sudo apt install -y firefox-esr firefox-esr-l10n-zh-cn
+```
+
+Firefox needs an environment variable to enable native Wayland:
+
+```bash
+# In sway config:
+exec_always systemctl --user import-environment MOZ_ENABLE_WAYLAND=1
+
+# Or in shell profile:
+export MOZ_ENABLE_WAYLAND=1
+```
+
+**Note**: Firefox defaults to XWayland even on Wayland sessions unless `MOZ_ENABLE_WAYLAND=1` is set. Without it, sway sees `app_id="firefox"` under XWayland with `class~="[Ff]irefox"`; with Wayland enabled, `app_id="firefox"` (native, different window properties).
+
+**Verification**: `about:support` → "Window Protocol" should say "wayland" (not "xwayland").
+
+### Matching browser windows in sway
+
+```bash
+# Chromium native Wayland
+for_window [app_id="chromium-browser"] border pixel 1
+for_window [app_id="^chromium-"] border pixel 1   # PWAs spawned from Chromium
+
+# Firefox native Wayland
+for_window [app_id="firefox" title="^Picture-in-Picture"] floating enable
+
+# Generic fallback (XWayland)
+for_window [class~="(?i)(firefox|chromium-browser|google-chrome)"] border pixel 1
+```
+
+
 ## Useful Tools
 
 | Tool | Purpose |
@@ -404,6 +653,38 @@ swaymsg 'output DP-<N> allow_tearing true'
 | Super+Shift+C | Reload config |
 | Super+number | Switch workspace |
 | Super+Shift+number | Move window to workspace |
+
+
+## TTY & DRM management
+
+### Switching between TTYs from SSH
+
+You can control which TTY a program runs on remotely via `openvt` and `chvt`:
+
+```bash
+# Start a program on TTY2 (skip getty conflict)
+sudo openvt -c 2 -f -- <command>
+
+# Switch active VT to TTY2 (needs physical display)
+chvt 2
+```
+
+### DRM exclusivity — one compositor at a time
+
+Programs that use DRM/KMS directly (sway, bcon, Weston, KDE's KWin) **cannot run simultaneously**. They each need exclusive access to the display hardware.
+
+```bash
+# bcon — a GPU-accelerated terminal that runs directly on the TTY,
+# not inside a Wayland window. It takes over DRM just like sway.
+# Running bcon while sway is active → "Failed to create backend"
+```
+
+**Correct workflow** to switch between them:
+1. Exit sway (`$mod+Shift+e`)
+2. Switch to another TTY (`Ctrl+Alt+F2`)
+3. Run `bcon` there
+4. Switch back to TTY1 (`Ctrl+Alt+F1`) to restart sway
+
 
 ## Chinese Input Method (fcitx5)
 
@@ -507,6 +788,49 @@ Then start fcitx5 again:
 fcitx5 -d
 ```
 
+
+## Network Management
+
+Debian 13 ships with `wpa_supplicant` + `dhcpcd` by default (no GUI). For a sway desktop, install **NetworkManager** which provides CLI, TUI, and GUI management.
+
+### Installation
+
+```bash
+sudo apt install -y network-manager network-manager-gnome
+```
+
+This provides `nmcli` (CLI), `nmtui` (TUI/foot), `nm-applet` (tray), and `nm-connection-editor` (GUI).
+
+### Migration from wpa_supplicant + dhcpcd
+
+After installing NM, Wi-Fi may show as `未托管` (unmanaged) because the standalone wpa_supplicant process still controls the interface. Fix:
+
+```bash
+sudo killall wpa_supplicant
+sudo systemctl restart NetworkManager
+```
+
+NM starts its own wpa_supplicant D-Bus instance internally. Scan and connect:
+
+```bash
+nmcli device wifi list
+nmcli device wifi connect "SSID" password "password"
+```
+
+### Sway Config
+
+```conf
+exec_always bash -c 'pkill -x nm-applet 2>/dev/null; sleep 0.3; exec nm-applet'
+bindsym $mod+n exec nm-connection-editor
+bindsym $mod+Shift+n exec foot nmtui
+```
+
+### Pitfalls
+
+- **wpa_supplicant conflict** — if Wi-Fi shows as `未托管`, kill standalone wpa_supplicant and restart NM.
+- **No tray on swaybar** — nm-applet needs waybar tray to show icon; runs silently otherwise.
+
+
 ## 蓝牙
 
 Setup Bluetooth on Sway/Wayland — pairing, tray management, and audio.
@@ -558,6 +882,82 @@ After adding, reload sway: `swaymsg reload` (only works from inside a sway sessi
 systemctl status bluetooth
 # Active: active (running) — should be enabled by default
 ```
+
+
+## Input Device Configuration
+
+Sway groups input devices by three `type:` classifiers — no need to know specific device names. All three should be configured for a laptop/tablet setup.
+
+### Touchpad (touchpad)
+
+```conf
+input type:touchpad {
+    tap enabled               # 轻触=点击
+    natural_scroll enabled    # 双指滚动方向=内容方向
+    click_method button_areas # 触控板左下=右键，下中=中键
+    middle_emulation enabled  # 三指同时点击=中键
+    dwt enabled               # 打字时禁用触摸板
+    scroll_factor 0.5         # 滚动速度减半（高分辨屏适配）
+}
+```
+
+| Setting | Values | Purpose |
+|---------|--------|---------|
+| `tap` | `enabled`/`disabled` | 单指轻触模拟左键点击 |
+| `natural_scroll` | `enabled`/`disabled` | 双指上滑=内容上滚（触控板默认） |
+| `click_method` | `button_areas`/`clickfinger`/`none` | 区域分左右键 / 多指分左右键 |
+| `middle_emulation` | `enabled`/`disabled` | 三指同时点击 = 中键粘贴 |
+| `dwt` (disable-while-typing) | `enabled`/`disabled` | 敲键盘时暂停触摸板，防误触 |
+| `scroll_factor` | float (0.1–10) | 滚动距离乘数，高分屏调低 |
+
+### Touchscreen (touch)
+
+```conf
+input type:touch {
+    tap enabled               # 触摸屏点击即触发
+    natural_scroll enabled
+    scroll_factor 0.5
+}
+```
+
+### Pointer/Mouse (pointer)
+
+```conf
+input type:pointer {
+    natural_scroll disabled   # 传统滚轮方向（上滚=页面上移）
+    accel_profile adaptive    # 自适应加速度：慢移精细，快移快速
+    pointer_accel 0.0         # 加速度基数
+}
+```
+
+| Setting | Values | Purpose |
+|---------|--------|---------|
+| `natural_scroll` | `enabled`/`disabled` | true mouse users want this OFF |
+| `accel_profile` | `adaptive`/`flat`/`none` | adaptive = 速度越快指针移动越大 |
+| `pointer_accel` | float (-1 to 1) | 基础加速量 |
+
+### Device-specific (when `type:` isn't enough)
+
+```bash
+swaymsg -t get_inputs     # → find "identifier" field
+```
+
+```conf
+input "2:14:SynPS/2_Synaptics_TouchPad" {
+    tap enabled
+}
+```
+
+Prefer `type:` for portability; use identifier only when you need per-device differentiation.
+
+### Pitfalls
+
+- **`type:pointer` catches ALL pointing devices** — touchpad, TrackPoint, and external mice. Apply touchpad-specific settings AFTER pointer block so later blocks override.
+- **`scroll_factor < 1`** = slower scrolling (good for high-DPI touchpads). **`> 1`** = faster (trackball without scroll ring).
+- **`click_method button_areas` on small touchpads** may leave no area for middle click. Switch to `clickfinger` (2 fingers=right, 3=middle) instead.
+- **No xinput/synclient** on Wayland — all input config goes through sway.
+- **`type:` rules auto-match hotplugged devices** — no restart needed when plugging a mouse.
+
 
 ## Workspace Autostart & Session Persistence
 
@@ -868,6 +1268,52 @@ What else you can show in status:
 
 **Limitation:** swaybar status text is display-only — no click events on individual items.
 
+
+### Custom status script template
+
+Use the template at `templates/status-bar.sh` — copy to `~/.config/sway/status.sh`, `chmod +x`, then reference from bar config. The template is shellcheck-clean and uses proper i3bar JSON protocol.
+
+### i3bar protocol — why `{"version":1}` is required
+
+swaybar distinguishes JSON from plain text by checking the **first byte** of the status_command output:
+- Starts with `{` → i3bar protocol (JSON blocks), enables per-block colors
+- Starts with anything else → plain text (raw string displayed literally)
+
+This means `[{"full_text":"..."}]` **without the header is displayed as raw JSON text**, not parsed. Correct output format:
+
+```
+{"version:1}         # ← required first line
+[                    # ← outer array (never closes in infinite mode)
+[{"full_text":"..."}]  # first data line
+,[{"full_text":"..."}] # subsequent lines with leading comma
+```
+
+### Multiple bars (default + user)
+
+Including `/etc/sway/config` pulls in the **default bar** block (which shows date/time). Adding a second `bar {}` in the user config creates a **second bar** — both visible at the same position, overlapping. Fix: hide the default bar after include, and use an absolute path in `status_command`:
+
+```conf
+include /etc/sway/config
+
+exec_always swaymsg bar bar-0 mode invisible
+
+bar {
+    id bar-1
+    status_command /home/dr/.config/sway/status.sh
+    position top
+    colors {
+        statusline #ffffff
+        background #2e2e2e
+        inactive_workspace #32323200 #32323200 #5c5c5c
+    }
+}
+```
+
+Key details:
+- Use absolute path in `status_command` — `~` expansion isn't reliable
+- `exec_always swaymsg bar bar-0 mode invisible` — hides the inherited default bar
+- List bar IDs with `swaymsg -t get_bar_config` to find the right ID to hide
+
 ## Mouse Bindings for Titlebar
 
 Bind mouse buttons to titlebar actions:
@@ -892,6 +1338,73 @@ bindsym Button3 kill                    # right-click titlebar → close
 bindsym Button2 floating toggle         # middle-click → toggle floating
 ```
 
+
+### Where bindings fire (area flags)
+
+Mouse binds can be scoped to a region of the window. **By default (no flag), the binding only activates when the pointer is over the title bar.**
+
+| Flag | Area | Use case |
+|---|---|---|
+| *(none)* | Title bar only | Middle-click to close, title bar actions |
+| `--whole-window` | Border + title bar + content | Actions that work anywhere on a window |
+| `--border` | Window border only | Border-specific actions |
+| `--exclude-titlebar` | Border + content, but NOT title bar | Window content actions without catching title bar |
+
+**There is no `--titlebar` flag.** To target the title bar explicitly, omit area flags (the default scope is titlebar-only).
+
+
+
+## Swaynag Error Debugging
+
+When sway displays a popup bar saying *"There are errors in your config file"* (spawned via `swaynag --type error --message ...`), use **binary search** to isolate the problematic lines:
+
+1. **Kill stale swaynag** — it may persist across failed reloads:
+   ```bash
+   pkill swaynag
+   ```
+
+2. **Start with a minimal config** — just the include line:
+   ```bash
+   cat > ~/.config/sway/config << 'EOF'
+   include /etc/sway/config
+   EOF
+   ```
+   Reload: `swaymsg reload`. If no swaynag appears, the error is in your custom lines.
+
+3. **Binary search** — comment out half the custom lines, reload, check swaynag:
+   ```bash
+   sed -i 'N,Ms/^/#/' ~/.config/sway/config   # comment lines N-M
+   swaymsg reload
+   pgrep swaynag    # if found → error is in a different half
+   ```
+   Restore from backup (`cp ~/.config/sway/config.bak ~/.config/sway/config`), then narrow the range by halving.
+
+4. **Restore cleanly between iterations** — multiple sed operations on the same file leave it in a corrupted state. Always restore from a clean backup:
+   ```bash
+   cp ~/.config/sway/config.bak ~/.config/sway/config
+   ```
+   Then apply ONE sed change at a time.
+
+### Common config errors (not syntax, but runtime)
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| swaynag on reload: "errors in your config" | Duplicate keybinding (`bindsym` same key twice) | Add `unbindsym <key>` before the replacement `bindsym` |
+| swaynag on reload: "errors in your config" | Config section with color vars assigned but unused (e.g. `MCOL=$CLR_WARN` but printf uses `$CLR_DEF`) | Consume the color variable in printf or remove it |
+| swaynag on reload: "errors in your config" | A `for_window` pattern that never matches (e.g. wrong operator) | Change `app_id="^X"` → `app_id~="^X"` (see for_window criteria) |
+
+### for_window criteria: `=` vs `~=`
+
+Sway's `for_window` (and other criteria-based commands) uses two matching operators:
+
+| Operator | Semantics | Example |
+|---|---|---|
+| `=` | **Exact string match** — the value must match the property exactly | `[app_id="chromium-browser"]` only matches app_id literally equal to `chromium-browser` |
+| `~=` | **Regex match** — the value is an ERE (extended regex) pattern | `[app_id~="^chromium"]` matches any app_id starting with `chromium` (covers PWAs: `chromium-browser`, `chromium-PWA-calculator`, etc.) |
+
+**Never** use regex syntax (`^`, `$`, `(?i)`) with `=` — it treats them as literal characters. A pattern like `app_id="^chromium"` looks for a window with app_id literally equal to ``^chromium`` (six chars), which no real app will ever have.
+
+
 ## Pitfalls
 
 - **JSON config syntax errors**: Manually editing `config-top` (or any JSON config) can introduce missing commas or trailing commas. Tools like `waybar-pwa-gen.py` that read → modify → write the JSON will crash with `json.decoder.JSONDecodeError`. Fix: `python3 -c "import json; json.load(open('/path/to/config.json'))"` to validate before restarting the tool.
@@ -908,3 +1421,11 @@ bindsym Button2 floating toggle         # middle-click → toggle floating
 - **`.bash_profile` / `.profile` are user-owned config files** — do NOT write to them automatically or append content without explicit user direction or opt-in. These files control login shell behavior and auto-start logic; modifications can break the user's workflow. If a config change requires environment.d/ or bash_profile (e.g. TTY-launched sway needing `WLR_DRM_NO_MODIFIERS`), suggest the edited lines and let the user decide where to place them.
 - **TTY install pattern**: When in TTY (no GUI, sway not running), write complex install scripts to `~/t.sh` using `write_file` rather than running `curl | bash` or multi-line terminal commands. The user reviews the script, then runs `bash ~/t.sh`.
 - **`--whole-window` on mouse bindings**: Using `--whole-window` makes a mouse binding fire on the entire window (titlebar + borders + content area), not just the titlebar. For "click titlebar to close", use plain `bindsym Button2 kill` without `--whole-window` — otherwise clicking anywhere on the window triggers the action, which is confusing.
+- **`exec_always` accumulates long-lived processes on reload**: Unlike `exec` (runs once per sway login), `exec_always` re-runs every `swaymsg reload`. For daemons like uxplay, nm-applet, blueman-applet, this spawns a new instance without killing the old one. Only the first binds the port/socket; the rest sit idle consuming ~100 MB RSS each.
+
+  **Two solutions**:
+  1. `exec` (no restart on reload) — safe, no zombies.
+  2. `exec_always bash -c 'pkill -x <name> 2>/dev/null; sleep 0.5; exec <name> <args>'` — kills before starting.
+- **Monitor "detected but no signal"**: Usually a cable/adapter hardware issue, not a config problem.
+- **Compositor can't start on SSH**: Sway needs a TTY (real display). Run from TTY, not SSH.
+- **killall kanshi fails silently**: Requires `psmisc` (provides `killall`). If not installed, `killall` errors silently.

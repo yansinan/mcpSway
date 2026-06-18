@@ -1,12 +1,15 @@
 ---
 name: uxplay
 source: https://github.com/FDH2/UxPlay
-description: "Install, configure, and use UxPlay — an open-source AirPlay mirroring server that lets iOS/macOS clients mirror their screen to a Linux display. Covers Debian install, sway/Wayland compatibility via XWayland, and common usage patterns."
+description: "Install, configure, and use UxPlay — an open-source AirPlay mirroring server that lets iOS/macOS clients mirror their screen to a Linux display. Covers Debian install, sway/Wayland compatibility via XWayland, auto-start, CLI flags, and troubleshooting."
+tags: [uxplay, airplay, mirroring, wayland, sway]
 ---
 
 # UxPlay — AirPlay mirroring server for Linux
 
 [UxPlay](https://github.com/FDH2/UxPlay) (fork, 2800+ stars) / [antimof/UxPlay](https://github.com/antimof/UxPlay) (upstream, 2000+ stars). Uses GStreamer + avahi mDNS so the Linux box appears as an AirPlay target on the local network.
+
+UXPlay is an open-source AirPlay mirroring server. Works as an Apple TV-style receiver for iOS/macOS screen mirroring.
 
 ## When to load
 
@@ -43,47 +46,73 @@ uxplay
 
 This starts the service. iPhone/iPad/Mac (same LAN) sees the computer name in Control Center → Screen Mirroring.
 
+### Auto-start with sway + auto-fullscreen on connect
+
+uxplay's default behavior: **starts running headless; on client connect → pops a window; on client disconnect → closes the window**. This meshes perfectly with sway's `for_window` fullscreen rule.
+
+Two approaches, choose based on whether you need `swaymsg reload` to restart the daemon:
+
+#### Approach A: exec (one-shot, safe on reload)
+
+Runs only on sway login. Repeated `swaymsg reload` does NOT spawn duplicates.
+
+```
+include /etc/sway/config
+
+exec uxplay -n "我的设备" -nh -p
+for_window [app_id="uxplay"] fullscreen enable
+for_window [class~="(?i)uxplay"] fullscreen enable
+```
+
+#### Approach B: exec_always + kill-before-start (restarts on reload)
+
+When you need `swaymsg reload` to kill and restart the daemon (e.g. to pick up flag changes), use a single-line kill-then-exec wrapper:
+
+```
+exec_always bash -c 'pkill -x uxplay 2>/dev/null; sleep 0.5; exec uxplay -n 餐桌 -s 1920x1080 -fps 60 -hls -fs -vs "waylandsink fullscreen=true"'
+```
+
+**How it works**: `pkill -x uxplay` kills any existing instance → `sleep 0.5` allows port/network release → `exec uxplay ...` replaces the bash process with a fresh instance. Only one instance exists at any time.
+
+**Quoting pitfall**: the `-vs "waylandsink fullscreen=true"` argument uses bare double quotes inside the single-quoted bash -c string. This is correct — `"` inside `'...'` are literal quotes that bash interprets as argument grouping. Do NOT use `\\"` (backslash-escaped) inside single quotes — that produces a literal backslash in the argument.
+
+**Verification** — after reload, confirm the old PID is gone and a new one started:
+```bash
+OLD=$(pgrep -x uxplay)
+swaymsg reload
+sleep 3
+NEW=$(pgrep -x uxplay)
+[ -n "$NEW" ] && [ "$OLD" != "$NEW" ] && echo "ok" || echo "failed"
+```
+
+**`exec` not bare `exec_always`**: using `exec_always uxplay ...` (without the kill wrapper) spawns a new instance on every reload. The old instances keep running (same port → only the first binds). Over several reloads this silently accumulates ~100 MB RSS per zombie. Approach A or B above avoids this.
+
+How it works:
+- `exec uxplay` — starts uxplay once at sway login, waiting for AirPlay connections (safe across `swaymsg reload`)
+- `for_window [app_id="uxplay"]` — catches native Wayland window
+- `for_window [class~="(?i)uxplay"]` — catches XWayland window (uxplay is an X11 app, runs under XWayland)
+- When client disconnects → uxplay automatically closes the window → sway exits fullscreen naturally
+
 ### Common flags
 
 | Flag | Purpose |
 |------|---------|
 | `-n "Some Name"` | Custom AirPlay display name |
 | `-nh` | Don't append `@hostname` |
-| `-s wxh` | Requested client resolution (default `1920x1080`; e.g. `-s 3840x2160` for 4K). Client may not honor exactly. |
+| `-p` | Use standard AirPlay legacy ports (TCP 7000/7001/7100, UDP 6000/6001/7011) instead of random high port |
+| `-d` | Enable debug logging (stderr). **Caution**: output goes to parent tty/pipe, not a file or syslog — cannot be reviewed retroactively. |
+| `-s wxh` | Requested client resolution (default 1920x1080; e.g. `-s 3840x2160` for 4K). Client may not honor exactly. |
 | `-s wxh@r` | Resolution + refresh rate in Hz (default `@60`). |
 | `-h265` | Enable H.265 (4K) video. Changes default `-s` from 1080p → 4K. Needs recent Apple device. |
 | `-fps n` | Max frame rate request to client (default 30; `-fps 60` for smoother video) |
-| `-fs` | Fullscreen mode (works with Wayland/X11/KMS/D3D11). 与 `-vs "waylandsink fullscreen=true"` 或 sway `for_window` 规则配合使用。 |
-| `-vs videosink` | Choose GStreamer videosink. On sway/Wayland: `-vs "waylandsink fullscreen=true"` — 用引号将 videosink 名和属性括起来作为单个参数，这是文档指定的写法（`-fs` 也同时生效）。 |
-| `-p` | Random PIN code on each connect |
-| `-p 1234` | Fixed PIN code |
+| `-fs` | Fullscreen mode (works with Wayland/X11/KMS/D3D11). Can combine with sway `for_window` rule. |
+| `-nc` | **Do NOT** close video window when client stops mirroring |
+| `-hls` | Use lossless ALAC audio codec (higher quality than default AAC) |
+| `-pin xxxx` | Require 4-digit PIN |
+| `-vs 0` | Audio-only mode (no video window) |
+| `-vs videosink` | Choose GStreamer videosink. On sway: `-vs "waylandsink fullscreen=true"` |
+| `-vd DECODER` | Choose video decoder: `avdec_h264` (software), `vaapih264dec` (Intel HW), `v4l2h264dec` |
 | `-vsync no` | Disable audio/video sync if out of sync |
-
-### 分辨率/渲染窗口控制
-
-UxPlay 有两个层面可以控制画面大小：
-
-**客户端分辨率（`-s`）** — 向 iPhone/iPad 请求特定的流分辨率。这只是建议，客户端可能不严格遵守。默认 1920×1080；与 `-h265` 组合时默认升为 3840×2160。
-
-**渲染窗口（`-vs` + `-fs` + sway rules）** — GStreamer 视频输出窗口的行为由 videosink 参数控制。文档指定写法：`-vs "waylandsink fullscreen=true"`（引号将 videosink 名和属性作为单个参数传入）。在 sway 中三层全屏可共存：
-
-| 层 | 方式 | 说明 |
-|----|------|------|
-| GStreamer 层 | `-vs "waylandsink fullscreen=true"` | 让 waylandsink 窗口创建即全屏 |
-| uxplay 层 | `-fs` | uxplay 自身请求全屏模式 |
-| sway 层 | `for_window [app_id="uxplay"] fullscreen enable` | sway 窗口规则兜底 |
-
-**推荐组合（x1tablet 实测）：**
-```bash
-uxplay -n x1tablet -s 3840x2160 -h265 -fps 60 -fs -vs "waylandsink fullscreen=true"
-```
-
-sway 端配合：
-```ini
-# ~/.config/sway/config
-exec_always uxplay -n x1tablet -s 3840x2160 -h265 -fps 60 -fs -vs "waylandsink fullscreen=true"
-for_window [app_id="uxplay"] fullscreen enable
-```
 
 ### Window behavior
 - Press `q` or `Ctrl+C` in the running terminal to quit.
@@ -98,12 +127,55 @@ for_window [app_id="uxplay"] fullscreen enable
 
 - **Same LAN**: AirPlay uses Bonjour/mDNS for discovery. The iPhone and Linux box must be on the same broadcast domain. Tailscale / VPN does NOT carry mDNS.
 - **avahi-daemon** must be running (systemd service) — usually installed as a dependency.
-- **firwall**: port 7000/7001 (AirPlay) must be open on the LAN interface.
+- **Firewall**: port 7000/7001 (AirPlay) must be open on the LAN interface.
+
+## Troubleshooting: "can see the device but can't connect"
+
+When iOS discovers the uxplay name but the connection fails (spins then times out or disconnects):
+
+1. **Verify uxplay is actually running** — it may have crashed silently after starting (output goes to pipe):
+   ```bash
+   pgrep -a uxplay
+   ss -tlnp | grep uxplay   # should show port 7000 or similar
+   ```
+
+2. **Check mDNS registration** — verify the service is properly advertised via avahi:
+   ```bash
+   avahi-browse _airplay._tcp -t -r 2>/dev/null | grep -A5 "wlp3s0 IPv4"
+   ```
+   Look for: correct IPv4 address (not a stale/different IP), correct port, correct hostname.
+
+3. **Use standard AirPlay ports** — without `-p`, uxplay uses a random high port (e.g. 35447). Some iOS versions or network setups prefer standard ports:
+   ```bash
+   uxplay -n "My Name" -p    # TCP 7000/7001/7100, UDP 6000/6001/7011
+   ```
+
+4. **Use `-nh` to avoid @hostname suffix** — without it, iOS sees "Name@hostname.local", which can cause cache confusion:
+   ```bash
+   uxplay -n "我的设备" -nh -p   # iOS sees exactly "我的设备"
+   ```
+
+5. **Stale mDNS entries from previous uxplay instances** can confuse iOS (different MAC/port cached). Fix: kill all uxplay (`pkill -f uxplay`), refresh AirPlay list on iOS (toggle Airplane Mode or pull down Control Center → long-press screen mirroring).
+
+6. **Enable debug logging** to see the connection attempt:
+   ```bash
+   uxplay -n "My Name" -nh -p -d
+   # Watch stderr for handshake, auth, or codec errors
+   ```
+
+7. **Check avahi-daemon**: `systemctl status avahi-daemon`
+
+8. **Same subnet**: iPhone must be on the same LAN as the host. `ip -4 addr show | grep -v 127.0.0.1`
 
 ## Pitfalls
 
-- **Not a daemon by default**: `uxplay` runs in the foreground. To background it, either use `systemd --user` to wrap it, or background via terminal with `notify_on_complete=false`.
-- **XWayland only**: if sway doesn't have XWayland enabled (`sway --version` + check `dpkg -l xwayland`), UxPlay will fail to open a window. Fix: `sudo apt install xwayland` and restart sway.
-- **No audio** on some Wayland setups: UxPlay expects PulseAudio/PipeWire. if audio doesn't work, check `pactl info` — UxPlay routes audio through GStreamer's PulseAudio sink.
-- **iPhone won't find UxPlay**: check `ss -tlnp | grep -E ':7000|7001'` and `avahi-browse -a` to confirm mDNS registration. If avahi is running but no registration, try `uxplay -n "AirPlay Server"` with an explicit name.
-- **One session at a time**: only one client can mirror at once. Disconnect the current client before connecting another.
+- **Not a daemon by default**: `uxplay` runs in the foreground. To background it, either use `systemd --user` to wrap it, or `exec` from sway config.
+- **XWayland only**: if sway doesn't have XWayland enabled, UxPlay will fail to open a window. Fix: `sudo apt install xwayland` and restart sway.
+- **No audio** on some Wayland setups: UxPlay expects PulseAudio/PipeWire. If audio doesn't work, check `pactl info`.
+- **iPhone won't find UxPlay**: check `ss -tlnp | grep -E ':7000|7001'` and `avahi-browse -a` to confirm mDNS registration.
+- **One session at a time**: only one client can mirror at once.
+- **uxplay is an X11 app** — runs via XWayland. Use `class~="(?i)uxplay"` (regex) to match its window, not `app_id`.
+- **No `-nc` by default** — omitting `-nc` means the window auto-closes on disconnect, which is what you want with the sway `for_window` fullscreen pattern.
+- **Needs avahi-daemon** — verify with `systemctl status avahi-daemon`.
+- **Multiple uxplay instances leave stale mDNS records** — each restart with different flags creates a separate mDNS service entry. Kill old processes before starting a new one.
+- **No firewall needed** — default `iptables INPUT policy ACCEPT` works for AirPlay ports.
