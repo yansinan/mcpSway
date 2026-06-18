@@ -16,9 +16,9 @@ import json
 import sys
 from pathlib import Path
 
-# SWAY_DIR = mcpSway 子模块所在路径（脚本在 mcps/ 根目录，mcpSway 在同级子目录）
+# SWAY_DIR = mcpSway 子模块所在路径（脚本在 mcpSway 仓库根目录，skills 在同级目录）
 HERE = Path(__file__).resolve().parent
-SWAY_DIR = HERE / "mcpSway"
+SWAY_DIR = HERE
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
