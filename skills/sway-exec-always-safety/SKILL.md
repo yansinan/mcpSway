@@ -1,223 +1,156 @@
 ---
 name: sway-exec-always-safety
-title: sway config exec_always 完全指南：进程去重 + 写法陷阱
+title: Sway exec_always 安全参考
 category: sway
-tags: [sway, exec_always, swayidle, uxplay, quoting, sway-config, pkill, dedup, config-reload]
-description: >
-  Safeguard sway/i3 exec_always lines against duplicate processes on reload
-  (pkill + exec pattern), and avoid common pitfalls: line-continuation failure,
-  quoting nesting, patch-tool escape corruption, stale-process accumulation,
-  cross-machine API-port probing, and verification procedures.
-source: man 5 sway; session 2026-06-24 helix 屏保/投屏修复
+tags: [sway, exec_always, pkill, dedup, swayidle, config-reload]
+description: |
+  Reference for safe sway/i3 exec_always patterns: pkill+exec dedup wrapper,
+  single-line quoting rules, Bash vs exec_always quoting conflict, and
+  post-reload process hygiene.  Covers pitfalls from real-world swayidle,
+  UxPlay, and persistent-daemon configurations.
+source: man 5 sway; yansinan/mcpSway PRs; swayidle/UxPlay 实战
 ---
 
-# sway-exec-always-safety
+## §1 进程去重: 标准 pkill + exec 模式
 
-## 1. 进程去重：`pkill + exec` 模式
+`exec_always` 在 sway reload 时**重新执行**命令。不加去重会导致一个进程攒出多份实例 (swayidle 堆叠、UxPlay 残留、waybar 分身)。
 
-sway/i3 的 `exec_always` 每次 reload 都重新执行命令——**没有内置的进程去重或自动 kill 机制**。
-
-> 来源：sway(5) man page：*"Like exec, but the shell command will be executed again after reload."*
-
-直接写 `exec_always uxplay -n foo ...` 会导致每次 `$mod+Shift+c` 都多一个进程。
-
-### 标准方案
-
-用 `bash -c` 包装，先 `pkill` 再 `exec`：
-
-```ini
-exec_always bash -c 'pkill -x <进程名> 2>/dev/null; sleep 0.2; exec <进程名> <参数...>'
-```
-
-关键点：
-- `pkill -x` 精确匹配进程名，不误杀同名子进程
-- `2>/dev/null` 忽略第一次运行时的 pkill 报错
-- `sleep 0.2` 给系统时间释放资源（端口等）
-- `exec` 替换 shell 进程，不留下多余 sh 进程
-
-### 哪些 exec_always 需要保护
-
-| 类型 | 例子 | 需要？ | 说明 |
-|------|------|--------|------|
-| 带 `--replace` 的程序 | `fcitx5 -d --replace` | ❌ | 程序自带去重 |
-| 已先 `killall` 再启动 | `killall kanshi; kanshi` | ❌ | 手动 kill 在前面 |
-| 普通服务进程 | `uxplay`, `blueman-applet`, `nm-applet` | ✅ | 不加保护则每次 reload 多一个 |
-| 后台守护进程 | `waybar`, `swaybg` | ✅ | 已有 `killall` 包装的除外 |
-
-### 实际配置示例
-
-```ini
-# uxplay
-exec_always bash -c 'pkill -x uxplay 2>/dev/null; sleep 0.2; exec uxplay -n 餐桌 -s 1920x1080 -fps 60 -hls -fs -vs "waylandsink fullscreen=true"'
-
-# blueman-applet
-exec_always bash -c 'pkill -x blueman-applet 2>/dev/null; sleep 0.2; exec blueman-applet'
-```
-
-### pkill 的常见陷阱
-
-- 不要写 `exec_always pkill -x uxplay; uxplay ...`（两行）— 中间窗口期可能产生重复
-- `pkill` 不加 `-x` 可能误杀含相同子串的进程（如 `uxplay` 误杀 `uxplay-server`）
-- `sleep` 太短（< 0.1）端口可能还没释放，太长则 reload 有明显的延迟感
-- 不要用 `exec` 代替 `exec_always`：`exec` 只在 sway 首次启动时执行，reload 不重复
-
-### 验证
+标准做法: 每次执行前先 `pkill` 同名进程,再启动。
 
 ```bash
-# 查看当前 uxplay 进程数（应为 1）
-pgrep -cx uxplay
+# 单命令模式 (写在 sway config 的一行里):
+exec_always --no-startup-id pkill -x swayidle; exec swayidle -w ...
 
-# 触发 reload 后再查
-swaymsg reload
-pgrep -cx uxplay   # 仍应为 1
+# 或封装为 wrapper shell 函数 (写在 ~/.config/sway/exec-wrappers.sh):
+kill_and_exec() {
+  local name="$1"; shift
+  pkill -x "$name" 2>/dev/null
+  exec "$@"        # exec 替换当前 shell 进程,防止堆积
+}
 ```
 
-## 2. exec_always 写法陷阱
-
-以下陷阱来源于 helix 机器上 swayidle 屏保和 uxplay 投屏配 置的实际修复过程。
-
-### 2.1 sway config 不支持多行续行
-
-#### 错误写法（不生效）
-```ini
-exec_always swayidle -w \
-  timeout 600 'chromium --new-window "URL" >/dev/null 2>&1' \
-  resume "swaymsg [title=\"Screen Saver\"] kill"
+在 sway config 中引用:
+```
+exec_always --no-startup-id exec-wrappers.sh swayidle -w ...
 ```
 
-sway 把每一行当作独立命令解析：
-- 第 1 行 `exec_always swayidle -w \` — `\` 是字面字符，不是 shell 续行符
-- 第 2 行 试图 exec 字面字符串 `timeout 600 ...`（找不到 binary，静默失败）
-- 第 3 行 同上，试图 exec `resume ...`
+关键要求:
+- `pkill -x` 匹配完整进程名,避免误杀 (例如 `pkill -x sway` 不会误杀 swayidle)
+- 用 `-f` 匹配完整命令行时,模式要足够精确
+- `exec` 替换 shell 进程,避免 wrapper shell 本身在进程列表里留下一层
 
-#### 正确写法（单行）
-```ini
-exec_always swayidle -w timeout 600 'chromium --new-window "URL" >/dev/null 2>&1' resume 'swaymsg [title="Screen Saver"] kill'
+## §2 陷阱与规则
+
+### §2.1 sway config 不支持命令续行
+
+**规则**: sway config 每一行是一条独立的命令。Bash 风格的 `\` 续行符**不生效**——反斜杠被当作普通字符传给 shell。
+
+反例 (`\` 续行被 sway 当成新一行):
+```
+exec_always --no-startup-id long-command \
+  --flag value \
+  --another-flag
+# sway 第二行是独立语句 → 解析为未识别命令 → silent ignore
 ```
 
-**原理**：sway 把 `exec_always` 整行传给 `sh -c` 执行。sway config 不是 shell 脚本，`\n` 不续行。
+正解: 全部写在一行;或把命令写在外部脚本里,config 只写一行 `exec_always` 调用脚本。
 
-### 2.2 引号嵌套规则
-
-| 层 | 解析器 | 引号规则 |
-|---|---|---|
-| 外层 | sway config | 无引号解析，整行给 `sh -c` |
-| 中层 | `sh -c` | 用 `'...'` 保护内部双引号 |
-| 内层 | chromium URL / swaymsg 参数 | 纯双引号 `"..."` |
-
-写进文件后原始字节应该是：
-```
-exec_always swayidle ... timeout 600 'chromium --new-window "URL" >/dev/null 2>&1' resume 'swaymsg [title="Screen Saver"] kill'
-```
-
-用 `od -c` 或 `cat -A` 验证：文件中不能有字面反斜杠。
-
-### 2.3 patch 工具的 `\"` 陷阱
-
-#### 问题
-`patch` 工具的 JSON 参数里写 `\"`，会被序列化成**字面反斜杠 + 引号**写入文件：
-
-```
-patch(old_string='resume "swaymsg..."')
-# 文件里变成了
-resume \"swaymsg...
-```
-
-#### 修法
-- 用 `sed -i '14s/.*/.../'` 直接写整行（推荐）
-- 或用 `write_file` 重写整个文件
-- 避免用 `patch` 修含 `\"` 的行
-
-#### 验证
+超长命令拆进 wrapper script 的典型做法:
 ```bash
-sed -n '14p' /home/dr/.config/sway/config | od -c   # 看原始字节
+# ~/.config/sway/exec-wrappers.sh
+launch_complex_daemon() {
+  pkill -x mydaemon 2>/dev/null
+  exec mydaemon --flag1 value1 --flag2 value2 \
+    --long-flag value3
+}
+```
+config 只写:
+```
+exec_always --no-startup-id exec-wrappers.sh launch_complex_daemon
 ```
 
-### 2.4 用 `pgrep -ax` 而非 `ps | grep` 查进程
+### §2.2 引号嵌套规则
 
-#### 错误
-```bash
-ps -eo pid,args | grep [s]wayidle
+Bash 引号在 sway `exec_always` 里经过两层解析: sway 先解析一次,传给 shell 再解析一次。
+
+**规则**: sway config 里用双引号包裹传给 shell 的字符串; shell 层再用单引号保留内部特殊字符。
+
+**带多个 `-e` 参数的 notify-send 示例**:
 ```
-Hermes 自己的 bash wrapper 命令行里可能包含 `swayidle` 字符串，`ps | grep` 会误匹配。
-
-#### 正确
-```bash
-pgrep -ax swayidle   # 只匹配进程名=swayidle
+exec_always --no-startup-id bash -c "pkill -x swaync; swaync -s 2>&1 | grep -v 'connection closed' &"
 ```
 
-### 2.5 `swaymsg reload` 不会自动清理旧进程
+外层 `"..."` 给 sway,内层 `'...'` 给 bash。内层始终用单引号避免冲突。
 
-`swaymsg reload` 触发 `exec_always` 重跑时，新 swayidle 拉起但旧进程还在。多次 reload 后会堆积多个 idle 进程同时监听同一个 timeout，屏保会触发多次。
+### §2.3 `patch` 工具的 `"` 序列化陷阱
 
-#### 症状
-```bash
-pgrep -ax swayidle
-# 输出多个 PID，etime 不同
+Hermes `patch` 工具把整个文件当字符串处理,采用 JSON 编码序列化。sway config 中含 `"` 的行写入时,JSON 反序列化可能额外转义。这是 **Hermes 端的问题**,不是 sway 的问题。
+
+规避方法:
+- 写 sway config 时用 `write_file` 而非 `patch`,避免序列化层干预
+- sway config 中所有 `"` 保持原样写入,不需要额外反斜杠
+- 如果必须用 `patch` 编辑 config,先 `cat` 确认实际写入内容正确
+
+### §2.4 pgrep -ax 优于 ps | grep
+
+验证进程存活时,用 `pgrep` 替代 `ps | grep`:
+
+| 方式 | 问题 |
+|------|------|
+| `ps aux \| grep swayidle` | grep 进程自身可能被匹配;输出需二次解析;信号需要用`kill`命令单独发 |
+| `pgrep -x swayidle` | 精确匹配进程名,只返回 PID,可直接配合 `pkill` |
+
+验证 daemon 存活:
+```
+pgrep -x swayidle > /dev/null && echo "running" || echo "dead"
 ```
 
-#### 修法
-reload 前先手动 kill 旧的：
-```bash
-pkill -x swayidle ; swaymsg reload ; sleep 1 ; pgrep -ax swayidle
-```
+### §2.5 sway reload 不清理旧进程
 
-x1tablet 用 systemd user unit 守护的 swayidle 不受影响（`BindsTo=graphical-session.target`），这台 helix 没这套机制，只能手动。
+**这是 `exec_always` 最隐蔽的问题**: `sway reload` 重新执行所有 `exec_always`,但**不会**先 stop 之前启动的进程。旧进程和新进程共存:
 
-### 2.6 跨机调 Hermes API 探活（常见路径坑）
+- swayidle: 两个实例同时监听 idle 事件,行为不可预测
+- UxPlay: 两个进程争用同一个端口,第二个启动失败报 `Address already in use`
+- waybar: 两个实例同时渲染,widget 状态震荡
 
-调用远端 hermes agent 转发任务时，永远不要相信 `.env` 写的端口——服务可能因 key 校验失败没启动，或端口被别的进程占用。
-
-#### 探活顺序
-```bash
-# 1. TCP 探测（不要直接 curl，避免 shell 转义陷阱）
-for p in 8643 8787 5000 5001 ; do timeout 3 bash -c "</dev/tcp/<host>/$p" 2>&1 && echo "$p OPEN" || echo "$p closed" ; done
-
-# 2. 看实际监听 + 进程身份
-ssh <host> 'ss -tlnp | grep -v "127.0.0.53"'
-
-# 3. 看 hermes-gateway 启动日志
-ssh <host> 'journalctl --user --since "1 hour ago" | grep -iE "api_server|placeholder"'
-
-# 4. 用 python（干净字符串，避免 bash 转义）打 /v1/chat/completions
-python3 -c 'import urllib.request,json; req=urllib.request.Request("http://<host>:<port>/v1/chat/completions",data=json.dumps({"model":"hermes","messages":[{"role":"user","content":"ping"}],"max_tokens":10}).encode(),headers={"Authorization":"Bearer <KEY>","Content-Type":"application/json"}); print(urllib.request.urlopen(req,timeout=8).read()[:300])'
-```
-
-#### 典型陷阱
-| .env 写的 | 实际情况 | 教训 |
-|---|---|---|
-| `API_SERVER_PORT=8643` | 服务未启动（key 校验失败），5000 是 code-server | 先 `ss -tlnp` 看 PID 和 cmdline |
-| `API_SERVER_KEY=<8chars>` | 服务无限循环刷"Refusing to start: <16 chars" | placeholder key 太短，必须 `openssl rand -hex 32` |
-| `Authorization: Bearer <KEY>` | 401 Unauthorized | 端口对了但 key 不对，或端口实际是别人的服务 |
-
-## 3. 验证清单（修改 sway config 后）
+**正确的模式**: 每个 `exec_always` 命令必须自包含去重逻辑,不能依赖 sway 帮你清理。
 
 ```bash
-# 1. 语法检查
-sway -C -c ~/.config/sway/config
-
-# 2. 查看原始字节（确认无转义反斜杠）
-sed -n '<行号>p' ~/.config/sway/config | od -c
-
-# 3. reload
-swaymsg reload
-
-# 4. 检查目标进程
-pgrep -ax swayidle
-
-# 5. 检查重要依赖
-systemctl is-active avahi-daemon          # uxplay 需要 mDNS
-systemctl is-active avahi-daemon.socket   # uxplay 需要 mDNS
+# 通用 wrapper — 放在 exec-wrappers.sh 中
+launch_singleton() {
+  local name="$1"; shift
+  pkill -x "$name" 2>/dev/null
+  sleep 0.1
+  exec "$@"
+}
 ```
 
-## 4. 配套 support files
+config 中:
+```
+exec_always --no-startup-id exec-wrappers.sh launch_singleton swayidle -w ...
+```
 
-- `references/helix-screensaver-recovery-2026-06-24.md` —— helix 屏保恢复完整流程
-- `templates/swayidle-screensaver-exec-always.txt` —— 验证过的单行模板
-- `scripts/verify-sway-config.sh` —— 一键验证脚本（语法 + 原始字节 + 进程 + 依赖）
+`sleep 0.1` 给被杀的进程释放资源 (端口、锁文件),尤其是 UxPlay 等监听 socket 的程序。
 
-## 5. 跨机分享
+## §3 验证清单
 
-本地 skill → x1tablet 的 `~/.hermes/skills/local_share/<category>/` → mcpSway 仓库 `skills/local/<name>/` → git push。
+修改 sway config 后验证流程:
 
-x1tablet 的 mcpSway 仓库里可能有占位目录，先 `cat` 确认是否空，空就填充，有内容就合并不覆盖。
+1. 语法检查: `sway --validate` / `sway -c ~/.config/sway/config 2>&1`
+   (不加 `-c` 默认检查当前 config)
+2. reload 验证: `sway reload` 后 `pgrep -ax <name>` 看进程计数,不应超过 1
+3. 端口冲突: `ss -tlnp | grep <port>` 确认单进程监听
+4. 功能测试: 等 idle timeout 触发 screensaver / 投屏可连接
+5. 日志检查: `journalctl --user -n 20 -u sway-session.target --grep ERROR`
+
+## §4 本 skill 自包含,无需外部资源
+
+本 skill 不依赖任何外部文件。所有 wrapper 示例可以直接复制到
+`~/.config/sway/exec-wrappers.sh` 并在 sway config 中 `source` 使用。
+
+## 历史上下文
+
+- 核心模式源自对 `exec_always` 去重的长期实践
+- §2.5 reload 不清理行为在 swayidle 屏保和 UxPlay 投屏配置中暴露最严重
+  (reload 后重复进程导致端口冲突和 idle 事件紊乱)
+- §2.1–§2.2 引号/续行规则来自 man 5 sway 和实际配置中遇到的行解析问题
